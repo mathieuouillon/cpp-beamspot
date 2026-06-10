@@ -1,0 +1,127 @@
+#ifndef BEAM_SPOT_H
+#define BEAM_SPOT_H
+
+// ==========================================================================
+// Beam spot analysis  (C++/ROOT port of the Java/groot BeamSpot)
+//
+// From the previous work by S. Stepanyan, CLAS12 Note 2020-003.
+//
+// The analysis is headless and written in a functional style: plain data
+// records (config / histograms / analysis) flow through free functions
+//
+//     histograms h = fill_dst(files, cfg, n_threads);   // or merge_files(...)
+//     analysis   a = analyze(std::move(h), cfg);
+//     beam_spot_result r = results(a);
+//     write_root(a, path); write_results_txt(a, path); write_ccdb_table(a, path);
+//
+// It fills histograms from CLAS12 DSTs, fits the target-window position as a
+// function of phi in theta bins, extracts the beam-spot (x0, y0, z0) and writes
+// a single self-describing ROOT file plus the physics/CCDB text deliverables.
+// All plotting lives in scripts/plot_beamspot.py.
+//
+// Multithreaded filling uses ROOT::TThreadedObject (one histogram per worker,
+// merged with TH1::Add). Original author: fbossu (at jlab.org).
+// ==========================================================================
+
+#include <memory>
+#include <string>
+#include <vector>
+
+#include <hipo4/bank.h>
+
+#include <TF1.h>
+#include <TGraphErrors.h>
+#include <TH1.h>
+#include <TH1F.h>
+#include <TH2F.h>
+
+namespace beamspot {
+
+// --------------------------------------------------------------------------
+// Analysis cuts and constants (documented; were magic numbers in the Java).
+// --------------------------------------------------------------------------
+namespace cuts {
+// track selection
+inline constexpr int dc_detector_id = 6;        // DetectorType.DC id: keep FD (DC) tracks only
+
+// particle selection
+inline constexpr int   electron_pid    = 11;    // require electrons
+inline constexpr float min_momentum    = 1.5F;  // GeV/c, electron momentum threshold
+inline constexpr float min_momentum_sq = min_momentum * min_momentum;  // compare p^2 to skip a sqrt
+
+// z-slice gaussian fit acceptance (per phi slice)
+inline constexpr double min_slice_integral = 10.0;  // skip near-empty phi slices
+inline constexpr double min_fit_integral   = 50.0;  // need enough entries inside the fit window
+inline constexpr double peak_half_window   = 6.0;   // peak must sit within target_z +/- this (cm)
+inline constexpr double min_amplitude      = 8.0;   // gaussian amplitude floor
+inline constexpr double min_sigma          = 0.1;   // |sigma| floor (cm)
+inline constexpr double max_sigma          = 2.0;   // |sigma| ceiling (cm)
+inline constexpr double min_chi2_ndf       = 0.05;  // reduced chi2 acceptance band ...
+inline constexpr double max_chi2_ndf       = 10.0;  // ... empirical, not strictly physical
+}  // namespace cuts
+
+// --------------------------------------------------------------------------
+// Data records
+// --------------------------------------------------------------------------
+
+// run configuration
+struct config {
+  std::vector<double> theta_bins{10, 11, 12, 13, 14, 16, 18, 22, 30};
+  double fit_range_scale = 1.0;
+  double target_z        = 25.4;
+  int    bins_per_sector = 10;
+
+  [[nodiscard]] std::size_t n_theta() const noexcept { return theta_bins.size() - 1; }
+};
+
+// the filled (and, for the MT path, already merged) histograms
+struct histograms {
+  std::unique_ptr<TH1F>              h1_z;       // z vertex distribution
+  std::unique_ptr<TH1F>              h1_phi;     // phi distribution at vertex
+  std::vector<std::unique_ptr<TH2F>> h2_z_phi;   // phi vs z, one per theta bin
+};
+
+// the analysis products; owns the histograms it was built from
+struct analysis {
+  histograms                                     histos;
+  std::vector<std::unique_ptr<TGraphErrors>>     g_results;  // target z vs phi, + modulation fit
+  std::vector<std::vector<std::unique_ptr<TH1>>> z_slices;   // kept z slices, each with its fit
+  std::unique_ptr<TGraphErrors>                  g_x, g_y, g_z, g_r, g_p;  // vs theta, + pol0 fit
+};
+
+struct value {
+  double v = 0.0;
+  double e = 0.0;
+};
+
+struct beam_spot_result {
+  value x, y, z, r, phi;
+};
+
+// --------------------------------------------------------------------------
+// Pipeline (free functions)
+// --------------------------------------------------------------------------
+
+// allocate empty, directory-detached histograms for one accumulation
+[[nodiscard]] histograms make_histograms(const config& cfg);
+
+// fill from CLAS12 DST files; n_threads > 1 uses ROOT::TThreadedObject + merge
+[[nodiscard]] histograms fill_dst(const std::vector<std::string>& files, const config& cfg, int n_threads);
+
+// the -m path: sum the per-theta TH2F from prior results ROOT files
+[[nodiscard]] histograms merge_files(const std::vector<std::string>& root_files, const config& cfg);
+
+// slice fits -> modulation fit -> theta extraction -> pol0; consumes the histograms
+[[nodiscard]] analysis analyze(histograms histos, const config& cfg);
+
+// final fitted beam-spot values, read off the summary graphs' pol0 fits
+[[nodiscard]] beam_spot_result results(const analysis& a);
+
+// outputs (paths assembled by the caller; nothing is built by hand here)
+void write_root(const analysis& a, const std::string& path);
+void write_results_txt(const analysis& a, const std::string& path);
+void write_ccdb_table(const analysis& a, const std::string& path);
+
+}  // namespace beamspot
+
+#endif  // BEAM_SPOT_H

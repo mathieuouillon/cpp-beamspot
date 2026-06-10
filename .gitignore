@@ -1,0 +1,19 @@
+# build output
+build/
+
+# editor / tooling caches
+.cache/
+.vscode/
+.idea/
+compile_commands.json
+
+# python venv for plotting
+.venv/
+__pycache__/
+
+# analysis output folders (reproducible)
+beamspot_out/
+run_*/
+
+# macOS
+.DS_Store
