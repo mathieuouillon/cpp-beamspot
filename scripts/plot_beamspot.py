@@ -21,14 +21,36 @@ import sys
 
 import numpy as np
 import uproot
-import matplotlib
+import matplotlib as mpl
 
-matplotlib.use("Agg")
+mpl.use("Agg")  # headless: render to files, never to a display
 import matplotlib.pyplot as plt
 import mplhep as hep
 from matplotlib.backends.backend_pdf import PdfPages
 
-plt.style.use(hep.style.ROOT)
+plt.rcParams["figure.dpi"] = "100"
+hep.style.use("CMSTex")
+mpl.rc("text", usetex=True)
+mpl.rc("font", size=18)
+mpl.rc("legend", fontsize=16)
+mpl.rc("text.latex", preamble=r"\usepackage{amsmath} \usepackage{lmodern}")
+
+plt.rcParams["xtick.direction"] = "in"
+plt.rcParams["ytick.direction"] = "in"
+plt.rcParams["xtick.top"] = True
+plt.rcParams["ytick.right"] = True
+plt.rcParams["xtick.minor.visible"] = True
+plt.rcParams["ytick.minor.visible"] = True
+plt.rcParams["xtick.major.size"] = 7
+plt.rcParams["ytick.major.size"] = 7
+plt.rcParams["xtick.major.width"] = 0.8
+plt.rcParams["ytick.major.width"] = 0.8
+plt.rcParams["xtick.minor.size"] = 4
+plt.rcParams["ytick.minor.size"] = 4
+plt.rcParams["xtick.minor.width"] = 0.5
+plt.rcParams["ytick.minor.width"] = 0.5
+plt.rcParams["axes.linewidth"] = 0.8
+plt.rcParams["errorbar.capsize"] = 3
 
 
 def find_results(output_dir, explicit):
@@ -143,10 +165,18 @@ def plot_slices(f, save):
             continue
 
         ncol = 6
-        nrow = (len(hkeys) + ncol - 1) // ncol
-        fig, axes = plt.subplots(nrow, ncol, figsize=(2.6 * ncol, 2.2 * nrow), squeeze=False)
+        n_used = len(hkeys)
+        nrow = (n_used + ncol - 1) // ncol
+        # wspace/hspace=0 packs the panels flush together (ROOT-style grid)
+        fig, axes = plt.subplots(nrow, ncol, figsize=(2.6 * ncol, 2.2 * nrow),
+                                 squeeze=False, gridspec_kw={"wspace": 0, "hspace": 0})
         for ax in axes.flatten():
             ax.axis("off")
+
+        # one common x-range so the flush columns line up
+        means = [params[hk]["mean"] for hk in hkeys if hk in params]
+        xlo, xhi = (np.median(means) - 6, np.median(means) + 6) if means else (None, None)
+
         for j, hk in enumerate(sorted(hkeys)):
             ax = axes.flatten()[j]
             ax.axis("on")
@@ -158,10 +188,15 @@ def plot_slices(f, save):
                 zz = np.linspace(p["lo"], p["hi"], 200)
                 ax.plot(zz, gaussian_plus_line(zz, p), color="red", lw=1.2)
                 ax.plot(zz, p["c"] + p["d"] * zz, color="tab:green", lw=1.0, ls="--")
-                ax.set_xlim(p["mean"] - 6, p["mean"] + 6)
-            ax.tick_params(labelsize=6)
+            if xlo is not None:
+                ax.set_xlim(xlo, xhi)
+            # keep tick labels only on the outer edge so they don't collide
+            col = j % ncol
+            is_bottom = (j + ncol) >= n_used   # nothing populated directly below
+            ax.tick_params(labelsize=6, labelleft=(col == 0), labelbottom=is_bottom)
         fig.suptitle(f"z slices, theta bin {bin_idx}", fontsize=12)
-        fig.tight_layout()
+        fig.supxlabel("z vertex (cm)", fontsize=11)
+        fig.subplots_adjust(left=0.05, right=0.99, top=0.94, bottom=0.06, wspace=0, hspace=0)
         save(fig, f"slices_bin{bin_idx}")
 
 

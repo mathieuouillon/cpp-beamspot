@@ -9,7 +9,7 @@
 // The analysis is headless and written in a functional style: plain data
 // records (config / histograms / analysis) flow through free functions
 //
-//     histograms h = fill_dst(files, cfg, n_threads);   // or merge_files(...)
+//     histograms h = fill_dst(files, cfg, n_jobs);      // or merge_files(...)
 //     analysis   a = analyze(std::move(h), cfg);
 //     beam_spot_result r = results(a);
 //     write_root(a, path); write_results_txt(a, path); write_ccdb_table(a, path);
@@ -19,8 +19,10 @@
 // a single self-describing ROOT file plus the physics/CCDB text deliverables.
 // All plotting lives in scripts/plot_beamspot.py.
 //
-// Multithreaded filling uses ROOT::TThreadedObject (one histogram per worker,
-// merged with TH1::Add). Original author: fbossu (at jlab.org).
+// Parallel filling spawns one worker *process* per file group (each running its
+// own single-threaded chain), then merges their partial histograms with
+// TH1::Add. On the JLab farm this scales better than in-process threads, which
+// contend on shared ROOT/heap state. Original author: fbossu (at jlab.org).
 // ==========================================================================
 
 #include <memory>
@@ -68,8 +70,14 @@ inline constexpr double max_chi2_ndf       = 10.0;  // ... empirical, not strict
 struct config {
   std::vector<double> theta_bins{10, 11, 12, 13, 14, 16, 18, 22, 30};
   double fit_range_scale = 1.0;
-  double target_z        = 25.4;
+  double target_z        = 19.6;
   int    bins_per_sector = 10;
+
+  // z-axis ranges (cm) of the filled histograms
+  double z_map_min = 15.0;   // 2D z-vs-phi map per theta bin (drives the slice fits)
+  double z_map_max = 25.0;
+  double z_1d_min  = 15.0;    // 1D z-vertex QA histogram (not used by the fit)
+  double z_1d_max  = 25.0;
 
   [[nodiscard]] std::size_t n_theta() const noexcept { return theta_bins.size() - 1; }
 };
@@ -105,8 +113,9 @@ struct beam_spot_result {
 // allocate empty, directory-detached histograms for one accumulation
 [[nodiscard]] histograms make_histograms(const config& cfg);
 
-// fill from CLAS12 DST files; n_threads > 1 uses ROOT::TThreadedObject + merge
-[[nodiscard]] histograms fill_dst(const std::vector<std::string>& files, const config& cfg, int n_threads);
+// fill from CLAS12 DST files; n_jobs > 1 forks one worker process per file group
+// and merges their partial histograms (n_jobs <= 1 streams a single chain).
+[[nodiscard]] histograms fill_dst(const std::vector<std::string>& files, const config& cfg, int n_jobs);
 
 // the -m path: sum the per-theta TH2F from prior results ROOT files
 [[nodiscard]] histograms merge_files(const std::vector<std::string>& root_files, const config& cfg);

@@ -1,21 +1,31 @@
 #include "beam_spot.h"
 
+#include <sys/mman.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <filesystem>
 #include <fstream>
 #include <memory>
+#include <new>
 #include <stdexcept>
+#include <thread>
 
 #include <fmt/format.h>
 
-#include <ROOT/TThreadedObject.hxx>
 #include <TDirectory.h>
 #include <TFile.h>
 #include <TMath.h>
 #include <TTree.h>
 
 #include <hipo4/chain.h>
+#include <hipo4/progresstracker.hpp>
+#include <hipo4/reader.h>
 
 namespace beamspot {
 
@@ -128,15 +138,6 @@ void for_each_hit(const hipo::bank& part, const hipo::bank& trk, const config& c
   }
 }
 
-// merge slot objects into a fresh target with TH1::Add semantics -- identical
-// to the previous per-thread accumulator merge (and, unlike the default
-// TH1::Merge, leaves bin errors untouched, which matters because they feed the
-// slice chi2 fits). Matches ROOT::TThreadedObjectUtils::MergeFunctionType<T>.
-const auto add_merge = [](auto target, auto& objs) {
-  for (auto& o : objs)
-    if (o && o.get() != target.get()) target->Add(o.get());
-};
-
 // analyse one theta bin: fit the z slices, then the phi modulation. Appends the
 // kept slices (each with its attached fit) to `slices_out`, sets the modulation
 // fit on `g_results`, and returns that fit (owned by `g_results`).
@@ -213,6 +214,220 @@ TF1* analyze_theta_bin(std::size_t bin, TH2F& h2, TGraphErrors& g_results,
   return mod;
 }
 
+// fill a single set of histograms by streaming one chain sequentially. If
+// `counter` is non-null it is bumped once per event read -- the multi-process
+// fill points it at a shared-memory slot so the parent can total live progress.
+histograms fill_dst_sequential(const std::vector<std::string>& files, const config& cfg,
+                               std::atomic<long>* counter) {
+  histograms result = make_histograms(cfg);
+
+  hipo::chain ch(/*threads=*/1, /*progress=*/false, /*verbose=*/false);
+  for (const auto& f : files) ch.add(f);
+  hipo::banklist banks = ch.getBanks({"REC::Particle", "REC::Track"});
+  const auto i_particle = hipo::getBanklistIndex(banks, "REC::Particle");
+  const auto i_track    = hipo::getBanklistIndex(banks, "REC::Track");
+
+  for (auto&& [event, file_index, event_index] : ch) {
+    event.readBanks(banks);
+    for_each_hit(banks[i_particle], banks[i_track], cfg, [&](std::size_t bin, float vz, float phi) {
+      result.h1_z->Fill(vz);
+      result.h1_phi->Fill(phi);
+      result.h2_z_phi[bin]->Fill(vz, phi);
+    });
+    if (counter != nullptr) counter->fetch_add(1, std::memory_order_relaxed);
+  }
+  return result;
+}
+
+// dump just the raw fill histograms (h1_z, h1_phi, h2_z_phi_*) so a parent
+// process can sum them back with merge_root_files(). Used by each fill worker.
+void write_partial_histograms(const histograms& h, const std::string& path) {
+  const std::unique_ptr<TFile> f{TFile::Open(path.c_str(), "RECREATE")};
+  if (!f || f->IsZombie()) {
+    throw std::runtime_error("beamspot: cannot open partial output file: " + path);
+  }
+  f->cd();
+  h.h1_z->Write();
+  h.h1_phi->Write();
+  for (const auto& hh : h.h2_z_phi) hh->Write();
+  f->Close();
+}
+
+// sum the per-theta TH2F (and the 1D summaries) from a list of results/partial
+// ROOT files into a fresh histogram set, using TH1::Add (errors in quadrature),
+// so the merged result is bit-identical to a single-pass fill.
+histograms merge_root_files(const std::vector<std::string>& root_files, const config& cfg, bool verbose) {
+  histograms h = make_histograms(cfg);
+  for (const auto& filename : root_files) {
+    if (verbose) fmt::print("Merging: {} ...\n", filename);
+    const std::unique_ptr<TFile> f{TFile::Open(filename.c_str(), "READ")};
+    if (!f || f->IsZombie()) {
+      throw std::runtime_error("beamspot: cannot open histogram file: " + filename);
+    }
+    for (std::size_t i = 0; i < h.h2_z_phi.size(); ++i) {
+      auto* src = f->Get<TH2F>(fmt::format("h2_z_phi_{}", i).c_str());
+      if (src == nullptr) {
+        throw std::runtime_error(fmt::format("beamspot: missing h2_z_phi_{} in {}", i, filename));
+      }
+      h.h2_z_phi[i]->Add(src);
+    }
+    if (auto* hz = f->Get<TH1F>("h1_z"))   h.h1_z->Add(hz);
+    if (auto* hp = f->Get<TH1F>("h1_phi")) h.h1_phi->Add(hp);
+  }
+  return h;
+}
+
+// split files into `n_jobs` groups, balanced by event count (greedy
+// least-loaded-first). Unreadable files are dropped with a warning. Returns the
+// groups (empty groups removed) and sets `total_events` to the grand total.
+std::vector<std::vector<std::string>> split_files(const std::vector<std::string>& files,
+                                                  int n_jobs, long& total_events) {
+  struct counted { std::string name; long events; };
+  std::vector<counted> counts;
+  counts.reserve(files.size());
+  for (const auto& f : files) {
+    try {
+      hipo::reader r;
+      r.open(f.c_str());
+      counts.push_back({f, static_cast<long>(r.getEntries())});
+    } catch (const std::exception& e) {
+      fmt::print(stderr, "[beamspot] skipping unreadable file '{}': {}\n", f, e.what());
+    }
+  }
+
+  // largest files first makes the greedy assignment balance much better
+  std::sort(counts.begin(), counts.end(),
+            [](const counted& a, const counted& b) { return a.events > b.events; });
+
+  const int groups = std::clamp(n_jobs, 1, std::max<int>(1, static_cast<int>(counts.size())));
+  std::vector<std::vector<std::string>> out(groups);
+  std::vector<long> load(groups, 0);
+  total_events = 0;
+  for (const auto& c : counts) {
+    const auto k = std::distance(load.begin(), std::min_element(load.begin(), load.end()));
+    out[k].push_back(c.name);
+    load[k] += c.events;
+    total_events += c.events;
+  }
+  out.erase(std::remove_if(out.begin(), out.end(),
+                           [](const auto& g) { return g.empty(); }),
+            out.end());
+  return out;
+}
+
+// fill by forking one worker process per file group, each running its own chain
+// single-threaded. On ifarm this beats in-process threads: no shared ROOT/heap
+// contention, and the kernel schedules independent readers across cores. Each
+// worker writes a partial-histogram ROOT file; the parent shows aggregate live
+// progress (via a shared-memory counter per worker) then merges the partials.
+histograms fill_dst_multiprocess(const std::vector<std::string>& files, const config& cfg,
+                                 int n_jobs, long& total_events) {
+  const auto groups = split_files(files, n_jobs, total_events);
+  const int  n_proc = static_cast<int>(groups.size());
+  if (n_proc == 0) {
+    throw std::runtime_error("beamspot: no readable input files");
+  }
+  if (n_proc == 1) {
+    // nothing to parallelise -- skip the fork/merge overhead entirely
+    std::atomic<long> ctr{0};
+    histograms h = fill_dst_sequential(groups.front(), cfg, &ctr);
+    total_events = ctr.load();
+    return h;
+  }
+
+  // shared-memory array of per-worker progress counters (visible across fork)
+  const std::size_t shm_bytes = sizeof(std::atomic<long>) * static_cast<std::size_t>(n_proc);
+  void* shm = mmap(nullptr, shm_bytes, PROT_READ | PROT_WRITE,
+                   MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+  if (shm == MAP_FAILED) {
+    throw std::runtime_error("beamspot: mmap failed for shared progress counters");
+  }
+  auto* counters = static_cast<std::atomic<long>*>(shm);
+  for (int k = 0; k < n_proc; ++k) new (&counters[k]) std::atomic<long>(0);
+
+  // per-run scratch dir for the partial histogram files
+  const std::filesystem::path tmp =
+      std::filesystem::temp_directory_path() / fmt::format("beamspot_{}", ::getpid());
+  std::error_code ec;
+  std::filesystem::create_directories(tmp, ec);
+  if (ec) {
+    munmap(shm, shm_bytes);
+    throw std::runtime_error("beamspot: cannot create temp dir " + tmp.string() + ": " + ec.message());
+  }
+  const auto partial_path = [&](int k) {
+    return (tmp / fmt::format("partial_{}.root", k)).string();
+  };
+
+  std::fflush(nullptr);  // flush inherited buffers before forking (workers _exit)
+
+  std::vector<pid_t> pids(n_proc, -1);
+  for (int k = 0; k < n_proc; ++k) {
+    const pid_t pid = ::fork();
+    if (pid < 0) {
+      munmap(shm, shm_bytes);
+      std::filesystem::remove_all(tmp, ec);
+      throw std::runtime_error("beamspot: fork failed");
+    }
+    if (pid == 0) {
+      // ---- worker process ----
+      try {
+        histograms h = fill_dst_sequential(groups[k], cfg, &counters[k]);
+        write_partial_histograms(h, partial_path(k));
+      } catch (const std::exception& e) {
+        fmt::print(stderr, "[beamspot] worker {} failed: {}\n", k, e.what());
+        ::_exit(1);
+      }
+      ::_exit(0);
+    }
+    pids[k] = pid;
+  }
+
+  // ---- parent: drive an aggregate progress bar and reap workers ----
+  ProgressTracker::Config pcfg;
+  pcfg.label     = fmt::format("Filling ({} procs)", n_proc);
+  pcfg.show_eta  = true;
+  pcfg.show_rate = true;
+  ProgressTracker progress(static_cast<std::size_t>(std::max(total_events, 1L)), pcfg);
+  progress.start();
+
+  const auto sum_counters = [&]() {
+    long s = 0;
+    for (int k = 0; k < n_proc; ++k) s += counters[k].load(std::memory_order_relaxed);
+    return s;
+  };
+
+  int  remaining = n_proc;
+  bool failed    = false;
+  while (remaining > 0) {
+    int   status = 0;
+    pid_t done   = 0;
+    while ((done = ::waitpid(-1, &status, WNOHANG)) > 0) {
+      --remaining;
+      if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) failed = true;
+    }
+    progress.set_processed(static_cast<std::size_t>(sum_counters()));
+    if (remaining > 0) std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  }
+  progress.set_processed(static_cast<std::size_t>(std::max(sum_counters(), total_events)));
+  progress.finish();
+
+  if (failed) {
+    munmap(shm, shm_bytes);
+    std::filesystem::remove_all(tmp, ec);
+    throw std::runtime_error("beamspot: one or more fill workers failed");
+  }
+
+  // merge the partial histograms back into one set, then clean up
+  std::vector<std::string> partials;
+  partials.reserve(n_proc);
+  for (int k = 0; k < n_proc; ++k) partials.push_back(partial_path(k));
+  histograms result = merge_root_files(partials, cfg, /*verbose=*/false);
+
+  munmap(shm, shm_bytes);
+  std::filesystem::remove_all(tmp, ec);
+  return result;
+}
+
 }  // namespace
 
 // --------------------------------------------------------------------------
@@ -221,12 +436,12 @@ histograms make_histograms(const config& cfg) {
     throw std::runtime_error("beamspot::make_histograms: need >= 2 theta bin edges");
   }
 
-  const auto zmin = static_cast<double>(static_cast<int>(cfg.target_z - 4.4));
-  const auto zmax = static_cast<double>(static_cast<int>(cfg.target_z + 15.6));
-  const int  bins = 6 * cfg.bins_per_sector;
+  const double zmin = cfg.z_map_min;
+  const double zmax = cfg.z_map_max;
+  const int    bins = 6 * cfg.bins_per_sector;
 
   histograms h;
-  h.h1_z   = std::make_unique<TH1F>("h1_z",   "z vertex;Z vertex (cm);counts",    200, -20, 50);
+  h.h1_z   = std::make_unique<TH1F>("h1_z",   "z vertex;Z vertex (cm);counts",    200, cfg.z_1d_min, cfg.z_1d_max);
   h.h1_phi = std::make_unique<TH1F>("h1_phi", "phi vertex;#phi (degrees);counts", 180, -30, 330);
   h.h1_z->SetDirectory(nullptr);
   h.h1_phi->SetDirectory(nullptr);
@@ -244,93 +459,31 @@ histograms make_histograms(const config& cfg) {
 }
 
 // --------------------------------------------------------------------------
-histograms fill_dst(const std::vector<std::string>& files, const config& cfg, int n_threads) {
-  hipo::chain ch(n_threads, /*progress=*/false, /*verbose=*/false);
-  for (const auto& f : files) ch.add(f);
-  hipo::banklist banks = ch.getBanks({"REC::Particle", "REC::Track"});
-  const auto i_particle = hipo::getBanklistIndex(banks, "REC::Particle");
-  const auto i_track     = hipo::getBanklistIndex(banks, "REC::Track");
-
+histograms fill_dst(const std::vector<std::string>& files, const config& cfg, int n_jobs) {
+  long       n   = 0;
+  const auto t0  = std::chrono::steady_clock::now();
   histograms result;
-  long n = 0;
-  const auto t0 = std::chrono::steady_clock::now();
 
-  if (n_threads <= 1) {
-    // sequential: fill a single set of histograms directly
-    result = make_histograms(cfg);
-    for (auto&& [event, file_index, event_index] : ch) {
-      event.readBanks(banks);
-      for_each_hit(banks[i_particle], banks[i_track], cfg, [&](std::size_t bin, float vz, float phi) {
-        result.h1_z->Fill(vz);
-        result.h1_phi->Fill(phi);
-        result.h2_z_phi[bin]->Fill(vz, phi);
-      });
-      ++n;
-    }
+  if (n_jobs <= 1) {
+    // single process: stream one chain sequentially, count events as we go
+    std::atomic<long> ctr{0};
+    result = fill_dst_sequential(files, cfg, &ctr);
+    n = ctr.load();
   } else {
-    // parallel: one histogram per worker via TThreadedObject, then merge
-    const auto zmin = static_cast<double>(static_cast<int>(cfg.target_z - 4.4));
-    const auto zmax = static_cast<double>(static_cast<int>(cfg.target_z + 15.6));
-    const int  bins = 6 * cfg.bins_per_sector;
-
-    ROOT::TThreadedObject<TH1F> t_z("h1_z", "z vertex;Z vertex (cm);counts", 200, -20, 50);
-    ROOT::TThreadedObject<TH1F> t_phi("h1_phi", "phi vertex;#phi (degrees);counts", 180, -30, 330);
-    std::vector<std::unique_ptr<ROOT::TThreadedObject<TH2F>>> t_h2;
-    t_h2.reserve(cfg.n_theta());
-    for (std::size_t i = 0; i < cfg.n_theta(); ++i) {
-      const double th = (cfg.theta_bins[i] + cfg.theta_bins[i + 1]) / 2.0;
-      t_h2.push_back(std::make_unique<ROOT::TThreadedObject<TH2F>>(
-          fmt::format("h2_z_phi_{}", i).c_str(),
-          fmt::format("#theta = {:g};Z vertex (cm);#phi (degrees)", th).c_str(),
-          100, zmin, zmax, bins, -30, 330));
-    }
-
-    ch.process(banks, [&](hipo::banklist& tb, int, long) {
-      for_each_hit(tb[i_particle], tb[i_track], cfg, [&](std::size_t bin, float vz, float phi) {
-        t_z.Get()->Fill(vz);          // per-thread instance, keyed by thread id
-        t_phi.Get()->Fill(phi);
-        t_h2[bin]->Get()->Fill(vz, phi);
-      });
-    });
-    n = ch.total_events_count();
-
-    result.h1_z   = t_z.SnapshotMerge(add_merge);
-    result.h1_phi = t_phi.SnapshotMerge(add_merge);
-    result.h2_z_phi.reserve(cfg.n_theta());
-    for (auto& t : t_h2) result.h2_z_phi.push_back(t->SnapshotMerge(add_merge));
-
-    result.h1_z->SetDirectory(nullptr);
-    result.h1_phi->SetDirectory(nullptr);
-    for (auto& h : result.h2_z_phi) h->SetDirectory(nullptr);
+    // multi-process: one worker per file group, merged from partial outputs
+    result = fill_dst_multiprocess(files, cfg, n_jobs, n);
   }
 
   const auto   t1  = std::chrono::steady_clock::now();
   const double sec = std::chrono::duration<double>(t1 - t0).count();
-  fmt::print("### {} files, {} events, {} thread(s), EVENT RATE: {:.4f} kHz\n",
-             files.size(), n, n_threads, sec > 0 ? n / sec / 1000.0 : 0.0);
+  fmt::print("### {} files, {} events, {} process(es), EVENT RATE: {:.4f} kHz\n",
+             files.size(), n, std::max(n_jobs, 1), sec > 0 ? n / sec / 1000.0 : 0.0);
   return result;
 }
 
 // --------------------------------------------------------------------------
 histograms merge_files(const std::vector<std::string>& root_files, const config& cfg) {
-  histograms h = make_histograms(cfg);
-  for (const auto& filename : root_files) {
-    fmt::print("Merging: {} ...\n", filename);
-    const std::unique_ptr<TFile> f{TFile::Open(filename.c_str(), "READ")};
-    if (!f || f->IsZombie()) {
-      throw std::runtime_error("beamspot: cannot open histogram file: " + filename);
-    }
-    for (std::size_t i = 0; i < h.h2_z_phi.size(); ++i) {
-      auto* src = f->Get<TH2F>(fmt::format("h2_z_phi_{}", i).c_str());
-      if (src == nullptr) {
-        throw std::runtime_error(fmt::format("beamspot: missing h2_z_phi_{} in {}", i, filename));
-      }
-      h.h2_z_phi[i]->Add(src);
-    }
-    if (auto* hz = f->Get<TH1F>("h1_z"))   h.h1_z->Add(hz);
-    if (auto* hp = f->Get<TH1F>("h1_phi")) h.h1_phi->Add(hp);
-  }
-  return h;
+  return merge_root_files(root_files, cfg, /*verbose=*/true);
 }
 
 // --------------------------------------------------------------------------

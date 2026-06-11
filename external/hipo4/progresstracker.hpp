@@ -67,6 +67,16 @@ class ProgressTracker {
     auto add(std::size_t count) noexcept -> void;
 
     ///
+    ///  @brief Sets the absolute progress count (thread-safe, no immediate display update).
+    ///
+    ///  Useful when progress is driven from an external source (e.g. the sum of
+    ///  per-worker counters in the multi-process fill) rather than incremented locally.
+    ///
+    auto set_processed(std::size_t value) noexcept -> void {
+        m_processed.store(value, std::memory_order_release);
+    }
+
+    ///
     ///  @brief Gets current progress count (thread-safe).
     ///
     [[nodiscard]] auto get_processed() const noexcept -> std::size_t {
@@ -160,6 +170,8 @@ class ProgressTracker {
     [[nodiscard]] auto get_elapsed() const noexcept -> std::chrono::seconds;
     [[nodiscard]] auto calculate_eta() const noexcept -> std::chrono::seconds;
     [[nodiscard]] auto calculate_rate() const noexcept -> double;
+    [[nodiscard]] auto calculate_instant_rate() const noexcept -> double;
+    [[nodiscard]] static auto format_rate(double rate) noexcept -> std::string;
     [[nodiscard]] auto get_progress_color() const noexcept -> std::string_view;
 
     const std::size_t m_total;
@@ -170,13 +182,18 @@ class ProgressTracker {
     bool m_finished{false};
     mutable std::size_t m_spinner_index{0};
 
+    // Sliding-window state for the instantaneous rate (sampled in update_display)
+    mutable std::chrono::steady_clock::time_point m_last_sample_time;
+    mutable std::size_t m_last_sample_count{0};
+    mutable double m_instant_rate{0.0};
+
     // Background update thread
     std::atomic<bool> m_should_stop{false};
     std::thread m_update_thread;
 };
 
 inline ProgressTracker::ProgressTracker(std::size_t total, Config config)
-    : m_total{total}, m_start_time{std::chrono::steady_clock::now()}, m_config{config} {
+    : m_total{total}, m_start_time{std::chrono::steady_clock::now()}, m_config{config}, m_last_sample_time{m_start_time} {
     if (total == 0) throw std::invalid_argument("ProgressTracker: total must be greater than 0");
 }
 
@@ -232,9 +249,35 @@ inline auto ProgressTracker::calculate_rate() const noexcept -> double {
     return elapsed > 0 ? static_cast<double>(current) / static_cast<double>(elapsed) : 0.0;
 }
 
+inline auto ProgressTracker::calculate_instant_rate() const noexcept -> double {
+    // Rate over the interval since the previous display tick, smoothed with an
+    // exponential moving average so it doesn't jitter. Sampled here because
+    // update_display() is the single periodic caller (guarded by m_display_mutex).
+    const auto now = std::chrono::steady_clock::now();
+    const auto current = m_processed.load(std::memory_order_acquire);
+    const double dt = std::chrono::duration<double>(now - m_last_sample_time).count();
+    if (dt >= 0.05) {
+        const double delta = static_cast<double>(current) - static_cast<double>(m_last_sample_count);
+        const double sample = delta > 0.0 ? delta / dt : 0.0;
+        m_instant_rate = m_instant_rate > 0.0 ? 0.6 * sample + 0.4 * m_instant_rate : sample;
+        m_last_sample_time = now;
+        m_last_sample_count = current;
+    }
+    return m_instant_rate;
+}
+
+inline auto ProgressTracker::format_rate(double rate) noexcept -> std::string {
+    if (rate < 1000.0) return fmt::format("{:.0f}/s", rate);
+    if (rate < 1000000.0) return fmt::format("{:.1f}k/s", rate / 1000.0);
+    return fmt::format("{:.2f}M/s", rate / 1000000.0);
+}
+
 inline auto ProgressTracker::calculate_eta() const noexcept -> std::chrono::seconds {
     const auto current = m_processed.load(std::memory_order_acquire);
-    const auto rate = calculate_rate();
+    // Prefer the (smoothed) instantaneous rate so the ETA reacts to the current
+    // pace; fall back to the cumulative average until the first sample lands.
+    const auto instant = calculate_instant_rate();
+    const auto rate = instant > 0.0 ? instant : calculate_rate();
 
     if (rate > 0.0 && current < m_total) {
         const auto remaining = m_total - current;
@@ -419,17 +462,23 @@ inline auto ProgressTracker::update_display() noexcept -> void {
             }
         }
 
-        // Rate
+        // Rate: instantaneous (⚡) with the running average (⌀) alongside
         if (m_config.show_rate) {
-            const auto rate = calculate_rate();
-            if (rate > 0.0) {
+            const auto instant = calculate_instant_rate();
+            const auto average = calculate_rate();
+            if (instant > 0.0 || average > 0.0) {
                 fmt::print(" ");
                 if (colors) fmt::print("{}", AnsiCodes::DIM);
                 fmt::print("│ ⚡");
                 if (colors) fmt::print("{}", AnsiCodes::RESET);
                 fmt::print(" ");
                 if (colors) fmt::print("{}", AnsiCodes::BRIGHT_MAGENTA);
-                fmt::print("{:.1f}/s", rate);
+                fmt::print("{}", format_rate(instant));
+                if (colors) fmt::print("{}", AnsiCodes::RESET);
+
+                fmt::print(" ");
+                if (colors) fmt::print("{}", AnsiCodes::DIM);
+                fmt::print("(⌀ {})", format_rate(average));
                 if (colors) fmt::print("{}", AnsiCodes::RESET);
             }
         }

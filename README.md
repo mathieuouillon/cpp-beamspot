@@ -31,11 +31,13 @@ beamspot::beam_spot_result r = beamspot::results(a);
 beamspot::write_root(a, path); /* + write_results_txt / write_ccdb_table */
 ```
 
-Multithreaded filling uses `ROOT::TThreadedObject<TH1F>/<TH2F>` — one histogram
-per worker thread, merged with `TH1::Add` semantics (via a custom `SnapshotMerge`
-function so the result is bit-identical to a single-threaded run). The per-track
-cut/bin logic is a single higher-order `for_each_hit(...)` shared by the
-sequential and parallel fill paths.
+Parallel filling spawns one worker **process** per file group (`-j N`), each
+running its own single-threaded `hipo::chain`, then merges their partial
+histograms with `TH1::Add` (bit-identical to a single-pass fill). On the JLab
+farm this beats in-process threads, which contend on shared ROOT/heap state. The
+parent shows one aggregate progress bar fed by a shared-memory counter per
+worker. The per-track cut/bin logic is a single higher-order `for_each_hit(...)`
+shared by the sequential and multi-process fill paths.
 
 ## Build
 
@@ -68,9 +70,11 @@ standard, change `cpp_std` in [`meson.build`](meson.build).
 | `-o` | `--output-dir` | `beamspot_out` | output folder (created if missing) |
 | `-p` | `--prefix` | `BeamSpot` | filename prefix |
 | `-r` | `--fit-range` | `1.0` | fit-range scale factor |
-| `-z` | `--target-z` | `25.4` | nominal target/foil Z (cm) |
+| `-z` | `--target-z` | `19.6` | nominal target/foil Z (cm) |
 | `-n` | `--bins-per-sector` | `10` | φ bins per sector |
-| `-j` | `--threads` | `0` | worker threads for the fill (0 = all cores) |
+| `-j` | `--jobs` | `0` | worker **processes** for the fill (0 = all cores) |
+|  | `--z-min` / `--z-max` | `15` / `25` | z range (cm) of the z-vs-φ map that drives the fits |
+|  | `--z1d-min` / `--z1d-max` | `15` / `25` | z range (cm) of the 1D z-vertex QA histogram |
 | `-m` | `--merge-histograms` | off | treat inputs as ROOT results files and `Add()` them |
 |  | `--dry-run` | off | run the analysis but write no files |
 | `-V` | `--version` | | print version |
@@ -90,10 +94,10 @@ Merge multiple runs without re-filling:
 ## Performance
 
 The fill loop reads CLAS12 DSTs through a `hipo::chain`. With `-j 1` it runs a
-single sequential pass; with `-j N` (or `-j 0` = all cores) it uses the chain's
-record-level parallelism with `ROOT::TThreadedObject` histograms (one per worker)
-merged with `TH1::Add` before the fit — the result is bit-identical to the
-single-threaded run.
+single sequential pass; with `-j N` (or `-j 0` = all cores) it forks N worker
+processes, each filling its own histograms from a balanced subset of the files,
+which are merged with `TH1::Add` before the fit — the result is bit-identical to
+the single-process run.
 
 Measured on one 9.1 GB DST (598,738 events, run 22083), 12-core machine:
 

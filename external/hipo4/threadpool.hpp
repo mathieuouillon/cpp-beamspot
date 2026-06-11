@@ -259,7 +259,7 @@ inline auto ThreadPool::shutdown(std::chrono::milliseconds timeout) noexcept -> 
     const auto deadline = std::chrono::steady_clock::now() + timeout;
 
     bool expected = false;
-    if (!m_stop_requested.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) fmt::print("Pool was already stopped\n");
+    if (!m_stop_requested.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) fmt::print(stderr, "Pool was already stopped\n");
 
     // Notify all workers to stop
     m_task_available.notify_all();
@@ -293,13 +293,12 @@ inline auto ThreadPool::shutdown(std::chrono::milliseconds timeout) noexcept -> 
 
     switch (shutdown_result) {
         case ThreadPool::ShutdownResult::Graceful:
-            fmt::print("Pool shutdown gracefully\n");
-            break;
+            break;  // normal path: stay quiet (was noise on the progress line)
         case ThreadPool::ShutdownResult::Forced:
-            fmt::print("Pool shutdown was forced (timeout)\n");
+            fmt::print(stderr, "Pool shutdown was forced (timeout)\n");
             break;
         case ThreadPool::ShutdownResult::AlreadyStopped:
-            fmt::print("Pool was already stopped\n");
+            fmt::print(stderr, "Pool was already stopped\n");
             break;
     }
 }

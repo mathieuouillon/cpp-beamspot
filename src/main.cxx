@@ -34,9 +34,13 @@ struct options {
   std::string output_dir      = "beamspot_out";
   std::string prefix          = "BeamSpot";
   double      fit_range       = 1.0;
-  double      target_z        = 25.4;
+  double      target_z        = 19.6;
   int         bins_per_sector = 10;
-  int         threads         = 0;  // 0 = all hardware cores
+  int         jobs            = 0;  // worker processes for the fill; 0 = all hardware cores
+  double      z_map_min       = 15.0;   // 2D z-vs-phi map z range (drives the fits)
+  double      z_map_max       = 25.0;
+  double      z_1d_min        = 15.0;    // 1D z-vertex QA histogram z range
+  double      z_1d_max        = 25.0;
   bool        merge           = false;
   bool        dry_run         = false;
   std::vector<std::string> inputs;
@@ -53,7 +57,11 @@ int main(int argc, char** argv) {
   app.add_option("-r", "--fit-range",       opt.fit_range,       "Fit-range scale factor");
   app.add_option("-z", "--target-z",        opt.target_z,        "Nominal target/foil Z (cm)");
   app.add_option("-n", "--bins-per-sector", opt.bins_per_sector, "Phi bins per sector");
-  app.add_option("-j", "--threads",         opt.threads,         "Worker threads for the fill (0 = all cores)");
+  app.add_option("-j", "--jobs",            opt.jobs,            "Worker processes for the fill (0 = all cores)");
+  app.add_option("",   "--z-min",           opt.z_map_min,       "z-vs-phi map: min Z (cm)");
+  app.add_option("",   "--z-max",           opt.z_map_max,       "z-vs-phi map: max Z (cm)");
+  app.add_option("",   "--z1d-min",         opt.z_1d_min,        "1D z-vertex QA histogram: min Z (cm)");
+  app.add_option("",   "--z1d-max",         opt.z_1d_max,        "1D z-vertex QA histogram: max Z (cm)");
   app.add_flag  ("-m", "--merge-histograms", opt.merge,   "Treat inputs as ROOT results files and Add() them");
   app.add_flag  ("",   "--dry-run",          opt.dry_run, "Run the analysis but write no files");
   app.add_positional("files", opt.inputs, "Input DST files, or ROOT results files with -m");
@@ -83,16 +91,17 @@ int main(int argc, char** argv) {
   };
 
   const unsigned hw = std::thread::hardware_concurrency();
-  const int n_threads = opt.threads > 0 ? opt.threads : (hw > 0 ? static_cast<int>(hw) : 1);
+  const int n_jobs = opt.jobs > 0 ? opt.jobs : (hw > 0 ? static_cast<int>(hw) : 1);
 
   const beamspot::config cfg{{10, 11, 12, 13, 14, 16, 18, 22, 30},
-                             opt.fit_range, opt.target_z, opt.bins_per_sector};
+                             opt.fit_range, opt.target_z, opt.bins_per_sector,
+                             opt.z_map_min, opt.z_map_max, opt.z_1d_min, opt.z_1d_max};
 
   // functional pipeline: fill/merge -> analyze -> results -> write
   beamspot::analysis a;
   try {
     beamspot::histograms histos = opt.merge ? beamspot::merge_files(opt.inputs, cfg)
-                                            : beamspot::fill_dst(opt.inputs, cfg, n_threads);
+                                            : beamspot::fill_dst(opt.inputs, cfg, n_jobs);
     a = beamspot::analyze(std::move(histos), cfg);
   } catch (const std::exception& e) {
     fmt::print(stderr, "beamspot: ERROR while reading input: {}\n", e.what());
