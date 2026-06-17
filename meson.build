@@ -54,11 +54,19 @@ inc = include_directories('include')
 
 beamspot_lib = static_library('beamspot_core',
   'src/beam_spot.cxx',
+  'src/ahdc_beam_spot.cxx',
   include_directories: inc,
   dependencies: [root_dep, hipo_dep])
 
 executable('beamspot',
   'src/main.cxx',
+  include_directories: inc,
+  link_with: beamspot_lib,
+  dependencies: [root_dep, hipo_dep],
+  install: true)
+
+executable('ahdc_beamspot',
+  'src/ahdc_main.cxx',
   include_directories: inc,
   link_with: beamspot_lib,
   dependencies: [root_dep, hipo_dep],

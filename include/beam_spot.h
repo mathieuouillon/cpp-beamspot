@@ -25,6 +25,9 @@
 // contend on shared ROOT/heap state. Original author: fbossu (at jlab.org).
 // ==========================================================================
 
+#include <algorithm>
+#include <cstddef>
+#include <iterator>
 #include <memory>
 #include <string>
 #include <vector>
@@ -36,6 +39,8 @@
 #include <TH1.h>
 #include <TH1F.h>
 #include <TH2F.h>
+
+#include "track_selector.h"
 
 namespace beamspot {
 
@@ -82,6 +87,27 @@ struct config {
   [[nodiscard]] std::size_t n_theta() const noexcept { return theta_bins.size() - 1; }
 };
 
+// --------------------------------------------------------------------------
+// Shared selection helpers (identical for every observable, so kept here once)
+// --------------------------------------------------------------------------
+
+// map a phi in [-180, 180) onto the histogram's [-30, 330) convention: shift the
+// negative half up by 360, then pop the topmost split sector back together.
+[[nodiscard]] inline float wrap_phi_deg(float phi) noexcept {
+  if (phi < 0)   phi += 360.0F;
+  if (phi > 330) phi -= 360.0F;
+  return phi;
+}
+
+// find the theta bin for `theta`: the first edge greater than theta, minus one.
+// Returns -1 when theta falls outside [theta_bins.front(), theta_bins.back()).
+[[nodiscard]] inline long theta_bin_of(const config& cfg, double theta) noexcept {
+  const auto upper = std::upper_bound(cfg.theta_bins.begin(), cfg.theta_bins.end(), theta);
+  const auto bin   = std::distance(cfg.theta_bins.begin(), upper) - 1;
+  if (bin < 0 || static_cast<std::size_t>(bin) >= cfg.n_theta()) return -1;
+  return bin;
+}
+
 // the filled (and, for the MT path, already merged) histograms
 struct histograms {
   std::unique_ptr<TH1F>              h1_z;       // z vertex distribution
@@ -107,6 +133,23 @@ struct beam_spot_result {
 };
 
 // --------------------------------------------------------------------------
+// Selectors
+// --------------------------------------------------------------------------
+
+// forward-detector electrons: REC::Track (DC, negative) -> REC::Particle
+// (electron above a momentum threshold). The original beam-spot selection.
+class electron_selector final : public track_selector {
+ public:
+  [[nodiscard]] std::vector<std::string> bank_names() const override;
+  void bind(hipo::banklist& banks) const override;
+  void process(const hipo::banklist& banks, const config& cfg, const emit_fn& emit) const override;
+
+ private:
+  mutable std::size_t i_particle_ = 0;
+  mutable std::size_t i_track_    = 0;
+};
+
+// --------------------------------------------------------------------------
 // Pipeline (free functions)
 // --------------------------------------------------------------------------
 
@@ -114,8 +157,10 @@ struct beam_spot_result {
 [[nodiscard]] histograms make_histograms(const config& cfg);
 
 // fill from CLAS12 DST files; n_jobs > 1 forks one worker process per file group
-// and merges their partial histograms (n_jobs <= 1 streams a single chain).
-[[nodiscard]] histograms fill_dst(const std::vector<std::string>& files, const config& cfg, int n_jobs);
+// and merges their partial histograms (n_jobs <= 1 streams a single chain). The
+// selector decides which banks to read and which tracks become (bin, z, phi).
+[[nodiscard]] histograms fill_dst(const std::vector<std::string>& files, const config& cfg,
+                                  const track_selector& sel, int n_jobs);
 
 // the -m path: sum the per-theta TH2F from prior results ROOT files
 [[nodiscard]] histograms merge_files(const std::vector<std::string>& root_files, const config& cfg);

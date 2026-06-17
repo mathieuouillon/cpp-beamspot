@@ -98,46 +98,6 @@ void fit_pol0(TGraphErrors& g) {
   return f != nullptr ? value{f->GetParameter(0), f->GetParError(0)} : value{};
 }
 
-// run the track/particle cuts for one event and invoke fill(bin, vz, phi) for
-// every accepted electron track. Shared by every fill backend.
-template <class Fill>
-void for_each_hit(const hipo::bank& part, const hipo::bank& trk, const config& cfg, Fill&& fill) {
-  const int n_tracks    = trk.getRows();
-  const int n_particles = part.getRows();
-  if (n_particles == 0 || n_tracks == 0) return;
-
-  for (int i = 0; i < n_tracks; ++i) {
-    // track cuts: forward-detector (DC) negative tracks only
-    if (trk.getByte("detector", i) != cuts::dc_detector_id) continue;
-    if (trk.getByte("q", i) > 0) continue;
-
-    const int pindex = trk.getShort("pindex", i);
-    if (pindex < 0 || pindex >= n_particles) continue;
-
-    // particle cuts: an electron above the momentum threshold
-    if (part.getInt("pid", pindex) != cuts::electron_pid) continue;
-    const float px = part.getFloat("px", pindex);
-    const float py = part.getFloat("py", pindex);
-    const float pz = part.getFloat("pz", pindex);
-    if (px * px + py * py + pz * pz < cuts::min_momentum_sq) continue;
-
-    // phi and theta from the transverse momentum components
-    auto phi = static_cast<float>(TMath::RadToDeg() * std::atan2(py, px));
-    if (phi < 0)   phi += 360.0F;  // map [-180,180) -> [0,360)
-    if (phi > 330) phi -= 360.0F;  // pop the split sector back together
-
-    const auto theta = static_cast<float>(
-        TMath::RadToDeg() * std::atan2(std::sqrt(px * px + py * py), pz));
-
-    // find the theta bin: first edge greater than theta, minus one
-    const auto upper = std::upper_bound(cfg.theta_bins.begin(), cfg.theta_bins.end(), theta);
-    const auto bin   = std::distance(cfg.theta_bins.begin(), upper) - 1;
-    if (bin < 0 || static_cast<std::size_t>(bin) >= cfg.n_theta()) continue;
-
-    fill(static_cast<std::size_t>(bin), part.getFloat("vz", pindex), phi);
-  }
-}
-
 // analyse one theta bin: fit the z slices, then the phi modulation. Appends the
 // kept slices (each with its attached fit) to `slices_out`, sets the modulation
 // fit on `g_results`, and returns that fit (owned by `g_results`).
@@ -218,22 +178,23 @@ TF1* analyze_theta_bin(std::size_t bin, TH2F& h2, TGraphErrors& g_results,
 // `counter` is non-null it is bumped once per event read -- the multi-process
 // fill points it at a shared-memory slot so the parent can total live progress.
 histograms fill_dst_sequential(const std::vector<std::string>& files, const config& cfg,
-                               std::atomic<long>* counter) {
+                               const track_selector& sel, std::atomic<long>* counter) {
   histograms result = make_histograms(cfg);
 
   hipo::chain ch(/*threads=*/1, /*progress=*/false, /*verbose=*/false);
   for (const auto& f : files) ch.add(f);
-  hipo::banklist banks = ch.getBanks({"REC::Particle", "REC::Track"});
-  const auto i_particle = hipo::getBanklistIndex(banks, "REC::Particle");
-  const auto i_track    = hipo::getBanklistIndex(banks, "REC::Track");
+  hipo::banklist banks = ch.getBanks(sel.bank_names());
+  sel.bind(banks);  // resolve bank indices against this chain's dictionary
+
+  const emit_fn emit = [&](std::size_t bin, float z, float phi) {
+    result.h1_z->Fill(z);
+    result.h1_phi->Fill(phi);
+    result.h2_z_phi[bin]->Fill(z, phi);
+  };
 
   for (auto&& [event, file_index, event_index] : ch) {
     event.readBanks(banks);
-    for_each_hit(banks[i_particle], banks[i_track], cfg, [&](std::size_t bin, float vz, float phi) {
-      result.h1_z->Fill(vz);
-      result.h1_phi->Fill(phi);
-      result.h2_z_phi[bin]->Fill(vz, phi);
-    });
+    sel.process(banks, cfg, emit);
     if (counter != nullptr) counter->fetch_add(1, std::memory_order_relaxed);
   }
   return result;
@@ -321,7 +282,7 @@ std::vector<std::vector<std::string>> split_files(const std::vector<std::string>
 // worker writes a partial-histogram ROOT file; the parent shows aggregate live
 // progress (via a shared-memory counter per worker) then merges the partials.
 histograms fill_dst_multiprocess(const std::vector<std::string>& files, const config& cfg,
-                                 int n_jobs, long& total_events) {
+                                 const track_selector& sel, int n_jobs, long& total_events) {
   const auto groups = split_files(files, n_jobs, total_events);
   const int  n_proc = static_cast<int>(groups.size());
   if (n_proc == 0) {
@@ -330,7 +291,7 @@ histograms fill_dst_multiprocess(const std::vector<std::string>& files, const co
   if (n_proc == 1) {
     // nothing to parallelise -- skip the fork/merge overhead entirely
     std::atomic<long> ctr{0};
-    histograms h = fill_dst_sequential(groups.front(), cfg, &ctr);
+    histograms h = fill_dst_sequential(groups.front(), cfg, sel, &ctr);
     total_events = ctr.load();
     return h;
   }
@@ -371,7 +332,7 @@ histograms fill_dst_multiprocess(const std::vector<std::string>& files, const co
     if (pid == 0) {
       // ---- worker process ----
       try {
-        histograms h = fill_dst_sequential(groups[k], cfg, &counters[k]);
+        histograms h = fill_dst_sequential(groups[k], cfg, sel, &counters[k]);
         write_partial_histograms(h, partial_path(k));
       } catch (const std::exception& e) {
         fmt::print(stderr, "[beamspot] worker {} failed: {}\n", k, e.what());
@@ -459,7 +420,8 @@ histograms make_histograms(const config& cfg) {
 }
 
 // --------------------------------------------------------------------------
-histograms fill_dst(const std::vector<std::string>& files, const config& cfg, int n_jobs) {
+histograms fill_dst(const std::vector<std::string>& files, const config& cfg,
+                    const track_selector& sel, int n_jobs) {
   long       n   = 0;
   const auto t0  = std::chrono::steady_clock::now();
   histograms result;
@@ -467,11 +429,11 @@ histograms fill_dst(const std::vector<std::string>& files, const config& cfg, in
   if (n_jobs <= 1) {
     // single process: stream one chain sequentially, count events as we go
     std::atomic<long> ctr{0};
-    result = fill_dst_sequential(files, cfg, &ctr);
+    result = fill_dst_sequential(files, cfg, sel, &ctr);
     n = ctr.load();
   } else {
     // multi-process: one worker per file group, merged from partial outputs
-    result = fill_dst_multiprocess(files, cfg, n_jobs, n);
+    result = fill_dst_multiprocess(files, cfg, sel, n_jobs, n);
   }
 
   const auto   t1  = std::chrono::steady_clock::now();
@@ -484,6 +446,54 @@ histograms fill_dst(const std::vector<std::string>& files, const config& cfg, in
 // --------------------------------------------------------------------------
 histograms merge_files(const std::vector<std::string>& root_files, const config& cfg) {
   return merge_root_files(root_files, cfg, /*verbose=*/true);
+}
+
+// --------------------------------------------------------------------------
+// electron_selector: forward-detector electrons (the original selection).
+// --------------------------------------------------------------------------
+std::vector<std::string> electron_selector::bank_names() const {
+  return {"REC::Particle", "REC::Track"};
+}
+
+void electron_selector::bind(hipo::banklist& banks) const {
+  i_particle_ = hipo::getBanklistIndex(banks, "REC::Particle");
+  i_track_    = hipo::getBanklistIndex(banks, "REC::Track");
+}
+
+void electron_selector::process(const hipo::banklist& banks, const config& cfg,
+                                const emit_fn& emit) const {
+  const hipo::bank& part = banks[i_particle_];
+  const hipo::bank& trk  = banks[i_track_];
+
+  const int n_tracks    = trk.getRows();
+  const int n_particles = part.getRows();
+  if (n_particles == 0 || n_tracks == 0) return;
+
+  for (int i = 0; i < n_tracks; ++i) {
+    // track cuts: forward-detector (DC) negative tracks only
+    if (trk.getByte("detector", i) != cuts::dc_detector_id) continue;
+    if (trk.getByte("q", i) > 0) continue;
+
+    const int pindex = trk.getShort("pindex", i);
+    if (pindex < 0 || pindex >= n_particles) continue;
+
+    // particle cuts: an electron above the momentum threshold
+    if (part.getInt("pid", pindex) != cuts::electron_pid) continue;
+    const float px = part.getFloat("px", pindex);
+    const float py = part.getFloat("py", pindex);
+    const float pz = part.getFloat("pz", pindex);
+    if (px * px + py * py + pz * pz < cuts::min_momentum_sq) continue;
+
+    // phi and theta from the transverse momentum components
+    const float phi = wrap_phi_deg(static_cast<float>(TMath::RadToDeg() * std::atan2(py, px)));
+    const auto  theta = static_cast<float>(
+        TMath::RadToDeg() * std::atan2(std::sqrt(px * px + py * py), pz));
+
+    const long bin = theta_bin_of(cfg, theta);
+    if (bin < 0) continue;
+
+    emit(static_cast<std::size_t>(bin), part.getFloat("vz", pindex), phi);
+  }
 }
 
 // --------------------------------------------------------------------------

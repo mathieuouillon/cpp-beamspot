@@ -1,7 +1,11 @@
-// BeamSpot -- CLAS12 beam-spot analysis (headless C++/ROOT port).
+// ahdc_beamspot -- CLAS12 beam-spot analysis from AHDC::kftrack tracks.
+//
+// Same engine and outputs as `beamspot`, but the per-event selection takes
+// AHDC central tracks instead of forward-detector electrons (see
+// include/ahdc_beam_spot.h for the method and its tan(theta) caveat).
 //
 // Usage:
-//   beamspot [options] FILES...
+//   ahdc_beamspot [options] FILES...
 // See --help for the full option list.
 
 #include <filesystem>
@@ -13,6 +17,7 @@
 
 #include <TROOT.h>
 
+#include "ahdc_beam_spot.h"
 #include "beam_spot.h"
 #include "cli.h"
 
@@ -31,16 +36,18 @@ enum class exit_code : int {
 constexpr int code(exit_code e) { return static_cast<int>(e); }
 
 struct options {
-  std::string output_dir      = "beamspot_out";
-  std::string prefix          = "BeamSpot";
+  std::string output_dir      = "beamspot_ahdc_out";
+  std::string prefix          = "BeamSpotAHDC";
   double      fit_range       = 1.0;
-  double      target_z        = 19.6;
+  double      target_z        = 0.0;     // AHDC default (cm); see ahdc_default_config()
   int         bins_per_sector = 10;
-  int         jobs            = 0;  // worker processes for the fill; 0 = all hardware cores
-  double      z_map_min       = 15.0;   // 2D z-vs-phi map z range (drives the fits)
-  double      z_map_max       = 25.0;
-  double      z_1d_min        = 15.0;    // 1D z-vertex QA histogram z range
-  double      z_1d_max        = 25.0;
+  int         jobs            = 0;        // worker processes for the fill; 0 = all hardware cores
+  double      z_map_min       = -10.0;    // 2D z-vs-phi map z range (drives the fits)
+  double      z_map_max       = 10.0;
+  double      z_1d_min        = -10.0;     // 1D z-vertex QA histogram z range
+  double      z_1d_max        = 10.0;
+  int         min_hits        = 4;        // AHDC::kftrack n_hits floor
+  double      max_chi2        = 50.0;     // AHDC::kftrack chi2 ceiling (mm^2)
   bool        merge           = false;
   bool        dry_run         = false;
   std::vector<std::string> inputs;
@@ -51,7 +58,7 @@ struct options {
 int main(int argc, char** argv) {
   options opt;
 
-  cli::parser app("beamspot", "BeamSpot -- CLAS12 beam-spot analysis");
+  cli::parser app("ahdc_beamspot", "ahdc_beamspot -- CLAS12 beam-spot analysis (AHDC tracks)");
   app.add_option("-o", "--output-dir",      opt.output_dir,      "Output folder (created if missing)");
   app.add_option("-p", "--prefix",          opt.prefix,          "Filename prefix");
   app.add_option("-r", "--fit-range",       opt.fit_range,       "Fit-range scale factor");
@@ -62,14 +69,16 @@ int main(int argc, char** argv) {
   app.add_option("",   "--z-max",           opt.z_map_max,       "z-vs-phi map: max Z (cm)");
   app.add_option("",   "--z1d-min",         opt.z_1d_min,        "1D z-vertex QA histogram: min Z (cm)");
   app.add_option("",   "--z1d-max",         opt.z_1d_max,        "1D z-vertex QA histogram: max Z (cm)");
+  app.add_option("",   "--min-hits",        opt.min_hits,        "AHDC::kftrack minimum n_hits");
+  app.add_option("",   "--max-chi2",        opt.max_chi2,        "AHDC::kftrack maximum chi2 (mm^2)");
   app.add_flag  ("-m", "--merge-histograms", opt.merge,   "Treat inputs as ROOT results files and Add() them");
   app.add_flag  ("",   "--dry-run",          opt.dry_run, "Run the analysis but write no files");
   app.add_positional("files", opt.inputs, "Input DST files, or ROOT results files with -m");
-  app.set_version("beamspot 1.0");
+  app.set_version("ahdc_beamspot 1.0");
   app.parse(argc, argv);
 
   if (opt.inputs.empty()) {
-    fmt::print(stderr, "beamspot: ERROR: no input files specified.\n\n{}", app.usage());
+    fmt::print(stderr, "ahdc_beamspot: ERROR: no input files specified.\n\n{}", app.usage());
     return code(exit_code::no_input);
   }
 
@@ -81,7 +90,7 @@ int main(int argc, char** argv) {
     std::error_code ec;
     fs::create_directories(output_dir, ec);
     if (ec) {
-      fmt::print(stderr, "beamspot: ERROR: cannot create output dir '{}': {}\n",
+      fmt::print(stderr, "ahdc_beamspot: ERROR: cannot create output dir '{}': {}\n",
                  output_dir.string(), ec.message());
       return code(exit_code::output_dir_error);
     }
@@ -93,24 +102,30 @@ int main(int argc, char** argv) {
   const unsigned hw = std::thread::hardware_concurrency();
   const int n_jobs = opt.jobs > 0 ? opt.jobs : (hw > 0 ? static_cast<int>(hw) : 1);
 
-  const beamspot::config cfg{{10, 11, 12, 13, 14, 16, 18, 22, 30},
-                             opt.fit_range, opt.target_z, opt.bins_per_sector,
-                             opt.z_map_min, opt.z_map_max, opt.z_1d_min, opt.z_1d_max};
+  // central-tracker defaults (theta bins) with the CLI-tunable fields applied
+  beamspot::config cfg = beamspot::ahdc_default_config();
+  cfg.fit_range_scale = opt.fit_range;
+  cfg.target_z        = opt.target_z;
+  cfg.bins_per_sector = opt.bins_per_sector;
+  cfg.z_map_min       = opt.z_map_min;
+  cfg.z_map_max       = opt.z_map_max;
+  cfg.z_1d_min        = opt.z_1d_min;
+  cfg.z_1d_max        = opt.z_1d_max;
 
   // functional pipeline: fill/merge -> analyze -> results -> write
   beamspot::analysis a;
   try {
-    const beamspot::electron_selector sel;
+    const beamspot::ahdc_selector sel(beamspot::ahdc_cuts{opt.min_hits, opt.max_chi2});
     beamspot::histograms histos = opt.merge ? beamspot::merge_files(opt.inputs, cfg)
                                             : beamspot::fill_dst(opt.inputs, cfg, sel, n_jobs);
     a = beamspot::analyze(std::move(histos), cfg);
   } catch (const std::exception& e) {
-    fmt::print(stderr, "beamspot: ERROR while reading input: {}\n", e.what());
+    fmt::print(stderr, "ahdc_beamspot: ERROR while reading input: {}\n", e.what());
     return code(exit_code::input_error);
   }
 
   const beamspot::beam_spot_result r = beamspot::results(a);
-  fmt::print("\nBeam-spot results:\n"
+  fmt::print("\nBeam-spot results (AHDC):\n"
              "  Z    = {} +- {} cm\n"
              "  R    = {} +- {} cm\n"
              "  Phi0 = {} +- {} deg\n"
@@ -128,7 +143,7 @@ int main(int argc, char** argv) {
     beamspot::write_results_txt(a, out("_results.txt"));
     beamspot::write_ccdb_table(a, out("_ccdb_table.txt"));
   } catch (const std::exception& e) {
-    fmt::print(stderr, "beamspot: ERROR while writing output: {}\n", e.what());
+    fmt::print(stderr, "ahdc_beamspot: ERROR while writing output: {}\n", e.what());
     return code(exit_code::write_error);
   }
   fmt::print("\nWrote:\n  {}\n  {}\n  {}\n",
